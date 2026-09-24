@@ -397,7 +397,7 @@ void OnUnload(const bp_api* api, const bp_addon_unload* ev) {
 
 bp_addon_info bp_addon(const bp_api* api) {
     return (bp_addon_info){
-        .id = "bpa-lua",
+        .id = "bpa_lua",
         .name = "Lua",
         .version = "1.0",
         .events = {
