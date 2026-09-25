@@ -86,6 +86,33 @@ bool callWithReport(lua_State* L, int nargs, int nresults) {
     return true;
 }
 
+void applyCancelReturn(lua_State* L, bool& cancel) {
+    if (lua_isboolean(L, -1) && !lua_toboolean(L, -1)) {
+        cancel = true;
+    }
+    lua_pop(L, 1);
+}
+
+void pushVec3(lua_State* L, bp_vec3 v) {
+    lua_newtable(L);
+    lua_pushnumber(L, v.x); lua_setfield(L, -2, "x");
+    lua_pushnumber(L, v.y); lua_setfield(L, -2, "y");
+    lua_pushnumber(L, v.z); lua_setfield(L, -2, "z");
+}
+
+void pushBlock(lua_State* L, bp_block block) {
+    lua_newtable(L);
+    lua_pushinteger(L, block.id);   lua_setfield(L, -2, "id");
+    lua_pushinteger(L, block.meta); lua_setfield(L, -2, "meta");
+}
+
+void pushItemStack(lua_State* L, bp_item_stack item) {
+    lua_newtable(L);
+    lua_pushinteger(L, item.id);    lua_setfield(L, -2, "id");
+    lua_pushinteger(L, item.count); lua_setfield(L, -2, "count");
+    lua_pushinteger(L, item.data);  lua_setfield(L, -2, "data");
+}
+
 // Lua-callable bindings
 extern "C" {
 
@@ -125,7 +152,8 @@ int lua_player_sendMessage(lua_State* L) {
 }
 int lua_player_kick(lua_State* L) {
     bp_player* player = static_cast<bp_player*>(checkHandle(L, 1, "Expected a player handle"));
-    g_api->player.kick(player);
+    const char* reason = luaL_optstring(L, 2, "Kicked");
+    g_api->player.kick(g_api, player, reason);
     return 0;
 }
 int lua_player_getUsername(lua_State* L) {
@@ -145,10 +173,7 @@ int lua_player_getEntity(lua_State* L) {
 int lua_entity_getPosition(lua_State* L) {
     bp_entity* entity = static_cast<bp_entity*>(checkHandle(L, 1, "Expected an entity handle"));
     bp_vec3 pos = g_api->entity.getPosition(entity);
-    lua_newtable(L);
-    lua_pushnumber(L, pos.x); lua_setfield(L, -2, "x");
-    lua_pushnumber(L, pos.y); lua_setfield(L, -2, "y");
-    lua_pushnumber(L, pos.z); lua_setfield(L, -2, "z");
+    pushVec3(L, pos);
     return 1;
 }
 int lua_entity_setPosition(lua_State* L) {
@@ -178,10 +203,7 @@ int lua_world_getBlock(lua_State* L) {
     bpos.z = static_cast<int32_t>(luaL_checkinteger(L, 4));
 
     bp_block block = g_api->world.getBlock(world, bpos);
-
-    lua_newtable(L);
-    lua_pushinteger(L, block.id); lua_setfield(L, -2, "id");
-    lua_pushinteger(L, block.meta); lua_setfield(L, -2, "meta");
+    pushBlock(L, block);
     return 1;
 }
 int lua_world_setBlock(lua_State* L) {
@@ -213,6 +235,14 @@ int lua_world_sendBlockUpdate(lua_State* L) {
 
     g_api->world.sendBlockUpdate(world, bpos, block);
     return 0;
+}
+// Best-effort world handle for events that don't carry one directly
+// (e.g. OnPlayerJoin, OnPlayerChat). Kept fresh by any event/call that
+// does hand us a world; nil if none has been seen yet.
+int lua_world_getCurrent(lua_State* L) {
+    if (!g_world) { lua_pushnil(L); return 1; }
+    lua_pushlightuserdata(L, g_world);
+    return 1;
 }
 
 // data.*
@@ -262,6 +292,7 @@ const luaL_Reg lua_world_fns[] = {
     {"getBlock", lua_world_getBlock},
     {"setBlock", lua_world_setBlock},
     {"sendBlockUpdate", lua_world_sendBlockUpdate},
+    {"getCurrent", lua_world_getCurrent},
     {nullptr, nullptr}
 };
 const luaL_Reg lua_data_fns[] = {
@@ -338,6 +369,43 @@ void OnPlayerJoin(const bp_api* /*api*/, const bp_player_join_event* ev) {
     }
 }
 
+void OnPlayerLeave(const bp_api* /*api*/, const bp_player_leave_event* ev) {
+    for (auto& plugin : g_plugins) {
+        lua_State* L = plugin.state.get();
+        if (!getGlobalFunction(L, "OnPlayerLeave")) continue;
+
+        lua_pushlightuserdata(L, ev->player);
+        callWithReport(L, 1, 0);
+    }
+}
+
+void OnPlayerMove(const bp_api* /*api*/, bp_player_move_event* ev) {
+    for (auto& plugin : g_plugins) {
+        lua_State* L = plugin.state.get();
+        if (!getGlobalFunction(L, "OnPlayerMove")) continue;
+
+        lua_pushlightuserdata(L, ev->player);
+        pushVec3(L, ev->from);
+        pushVec3(L, ev->to);
+
+        // A plugin can cancel the move by returning `false`.
+        if (callWithReport(L, 3, 1)) applyCancelReturn(L, ev->cancel);
+    }
+}
+
+void OnItemUse(const bp_api* /*api*/, bp_item_use_event* ev) {
+    for (auto& plugin : g_plugins) {
+        lua_State* L = plugin.state.get();
+        if (!getGlobalFunction(L, "OnItemUse")) continue;
+
+        lua_pushlightuserdata(L, ev->player);
+        pushItemStack(L, ev->item);
+
+        // A plugin can cancel the item use by returning `false`.
+        if (callWithReport(L, 2, 1)) applyCancelReturn(L, ev->cancel);
+    }
+}
+
 void OnBlockUse(const bp_api* /*api*/, bp_block_use_event* ev) {
     g_world = ev->world; // fallback world context, kept fresh here too
 
@@ -351,13 +419,68 @@ void OnBlockUse(const bp_api* /*api*/, bp_block_use_event* ev) {
         lua_pushinteger(L, ev->blockPos.y);
         lua_pushinteger(L, ev->blockPos.z);
 
-        if (callWithReport(L, 5, 1)) {
-            // A plugin can cancel the block-use by returning `false`.
-            if (lua_isboolean(L, -1) && !lua_toboolean(L, -1)) {
-                ev->cancel = true;
-            }
-            lua_pop(L, 1);
-        }
+        // A plugin can cancel the block-use by returning `false`.
+        if (callWithReport(L, 5, 1)) applyCancelReturn(L, ev->cancel);
+    }
+}
+
+void OnBlockBreak(const bp_api* /*api*/, bp_block_break_event* ev) {
+    g_world = ev->world; // fallback world context, kept fresh here too
+
+    for (auto& plugin : g_plugins) {
+        lua_State* L = plugin.state.get();
+        if (!getGlobalFunction(L, "OnBlockBreak")) continue;
+
+        lua_pushlightuserdata(L, ev->player);
+        lua_pushlightuserdata(L, ev->world);
+        pushItemStack(L, ev->tool);
+        lua_pushinteger(L, ev->blockPos.x);
+        lua_pushinteger(L, ev->blockPos.y);
+        lua_pushinteger(L, ev->blockPos.z);
+        pushBlock(L, ev->block);
+
+        // A plugin can cancel the break by returning `false`.
+        if (callWithReport(L, 7, 1)) applyCancelReturn(L, ev->cancel);
+    }
+}
+
+void OnBlockPlace(const bp_api* /*api*/, bp_block_place_event* ev) {
+    g_world = ev->world; // fallback world context, kept fresh here too
+
+    for (auto& plugin : g_plugins) {
+        lua_State* L = plugin.state.get();
+        if (!getGlobalFunction(L, "OnBlockPlace")) continue;
+
+        lua_pushlightuserdata(L, ev->player);
+        lua_pushlightuserdata(L, ev->world);
+        lua_pushinteger(L, ev->blockPos.x);
+        lua_pushinteger(L, ev->blockPos.y);
+        lua_pushinteger(L, ev->blockPos.z);
+        lua_pushinteger(L, ev->blockId);
+
+        // A plugin can cancel the placement by returning `false`.
+        if (callWithReport(L, 6, 1)) applyCancelReturn(L, ev->cancel);
+    }
+}
+
+void OnEntityDamage(const bp_api* /*api*/, bp_entity_damage_event* ev) {
+    for (auto& plugin : g_plugins) {
+        lua_State* L = plugin.state.get();
+        if (!getGlobalFunction(L, "OnEntityDamage")) continue;
+
+        lua_pushlightuserdata(L, ev->entity);
+        lua_pushinteger(L, ev->amount);
+
+        // A plugin can cancel the damage by returning `false`.
+        if (callWithReport(L, 2, 1)) applyCancelReturn(L, ev->cancel);
+    }
+}
+
+void OnServerTick(const bp_api* /*api*/, const bp_server_tick_event* /*ev*/) {
+    for (auto& plugin : g_plugins) {
+        lua_State* L = plugin.state.get();
+        if (!getGlobalFunction(L, "OnServerTick")) continue;
+        callWithReport(L, 0, 0);
     }
 }
 
@@ -369,13 +492,8 @@ void OnPlayerChat(const bp_api* /*api*/, bp_player_chat_event* ev) {
         lua_pushlightuserdata(L, ev->player);
         lua_pushstring(L, ev->message);
 
-        if (callWithReport(L, 2, 1)) {
-            // A plugin can cancel the chat message by returning `false`.
-            if (lua_isboolean(L, -1) && !lua_toboolean(L, -1)) {
-                ev->cancel = true;
-            }
-            lua_pop(L, 1);
-        }
+        // A plugin can cancel the chat message by returning `false`.
+        if (callWithReport(L, 2, 1)) applyCancelReturn(L, ev->cancel);
     }
 }
 
@@ -406,15 +524,15 @@ extern "C" bp_addon_info bp_addon(const bp_api* /*api*/) {
         "1.0",
         bp_addon_events{
             /* playerJoin   */ bpa::OnPlayerJoin,
-            /* playerLeave  */ nullptr,
+            /* playerLeave  */ bpa::OnPlayerLeave,
             /* playerChat   */ bpa::OnPlayerChat,
-            /* playerMove   */ nullptr,
-            /* itemUse      */ nullptr,
-            /* blockBreak   */ nullptr,
-            /* blockPlace   */ nullptr,
+            /* playerMove   */ bpa::OnPlayerMove,
+            /* itemUse      */ bpa::OnItemUse,
+            /* blockBreak   */ bpa::OnBlockBreak,
+            /* blockPlace   */ bpa::OnBlockPlace,
             /* blockUse     */ bpa::OnBlockUse,
-            /* entityDamage */ nullptr,
-            /* serverTick   */ nullptr,
+            /* entityDamage */ bpa::OnEntityDamage,
+            /* serverTick   */ bpa::OnServerTick,
             /* addonLoad    */ bpa::OnLoad,
             /* addonUnload  */ bpa::OnUnload,
         },
