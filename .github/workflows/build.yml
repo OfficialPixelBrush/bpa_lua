@@ -45,13 +45,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use runner-preinstalled vcpkg
+      - name: Set up standalone vcpkg (classic mode)
         shell: pwsh
         run: |
-          # GitHub's windows-2022 image ships vcpkg already; reuse it instead
-          # of cloning fresh (faster + avoids network flakiness).
-          Copy-Item -Recurse "$env:VCPKG_INSTALLATION_ROOT" "$env:VCPKG_ROOT"
-          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat"
+          # The runner-preinstalled vcpkg under VCPKG_INSTALLATION_ROOT is the
+          # copy that ships with Visual Studio. That copy is immutable and
+          # manifest-only, so plain `vcpkg install <port>:<triplet>` calls
+          # fail with "This vcpkg distribution does not have a classic mode
+          # instance." A fresh standalone clone supports classic mode.
+          git clone https://github.com/microsoft/vcpkg.git "$env:VCPKG_ROOT"
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
 
       - uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -98,11 +101,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use runner-preinstalled vcpkg
+      - name: Set up standalone vcpkg (classic mode)
         shell: pwsh
         run: |
-          Copy-Item -Recurse "$env:VCPKG_INSTALLATION_ROOT" "$env:VCPKG_ROOT"
-          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat"
+          # See the windows-x64 job above for why we don't reuse the
+          # runner-preinstalled (VS-bundled) vcpkg here.
+          git clone https://github.com/microsoft/vcpkg.git "$env:VCPKG_ROOT"
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
 
       - uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -219,9 +224,14 @@ jobs:
 
       - name: "Build (Release settings: -O2, stripped)"
         run: |
+          # Homebrew's lua formula installs headers/lib unversioned
+          # (include/lua.h, -llua), not under a lua5.4/ subdir or -llua5.4,
+          # so use pkg-config against its own lua.pc rather than hardcoding
+          # a versioned path.
           LUA_PREFIX="$(brew --prefix lua)"
+          export PKG_CONFIG_PATH="${LUA_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH}"
           clang++ -std=c++17 -O2 -DNDEBUG -shared -fPIC -undefined dynamic_lookup \
-            -I"${LUA_PREFIX}/include/lua${LUA_VERSION}" -L"${LUA_PREFIX}/lib" -llua${LUA_VERSION} \
+            $(pkg-config --cflags --libs lua) \
             src/bpa_lua.cpp -o ${BINARY_NAME}.so
           strip -x ${BINARY_NAME}.so
 
