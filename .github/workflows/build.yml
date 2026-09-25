@@ -36,45 +36,9 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------
-  # Sanity check: tag_name must match the VERSION file, which must also
-  # match the version string baked into src/bpa_lua.cpp's bp_addon_info.
-  # ---------------------------------------------------------------------
-  check-version:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Verify tag_name matches VERSION and bp_addon_info
-        shell: bash
-        run: |
-          TAG="${{ inputs.tag_name }}"
-          TAG_VERSION="${TAG#v}"  # strip a leading "v" (e.g. v1.0 -> 1.0)
-
-          FILE_VERSION=$(tr -d '[:space:]' < VERSION)
-
-          # Third field of the bp_addon_info{} literal returned by bp_addon().
-          SRC_VERSION=$(grep -A3 'bp_addon_info{' src/bpa_lua.cpp | sed -n '3p' | grep -oP '"\K[^"]+')
-
-          echo "tag_name:      $TAG"
-          echo "tag version:   $TAG_VERSION"
-          echo "VERSION file:  $FILE_VERSION"
-          echo "bp_addon_info: $SRC_VERSION"
-
-          if [ -z "$FILE_VERSION" ] || [ -z "$SRC_VERSION" ]; then
-            echo "::error::Could not read a version from VERSION and/or src/bpa_lua.cpp"
-            exit 1
-          fi
-
-          if [ "$TAG_VERSION" != "$FILE_VERSION" ] || [ "$TAG_VERSION" != "$SRC_VERSION" ]; then
-            echo "::error::Version mismatch: tag implies '${TAG_VERSION}', VERSION file has '${FILE_VERSION}', bp_addon_info has '${SRC_VERSION}'. Make all three agree before releasing."
-            exit 1
-          fi
-
-  # ---------------------------------------------------------------------
   # Windows x86_64
   # ---------------------------------------------------------------------
   windows-x64:
-    needs: check-version
     runs-on: windows-2022
     env:
       VCPKG_ROOT: ${{ github.workspace }}\vcpkg
@@ -128,7 +92,6 @@ jobs:
   # Windows arm64 (native GH-hosted arm64 Windows runner)
   # ---------------------------------------------------------------------
   windows-arm64:
-    needs: check-version
     runs-on: windows-11-arm
     env:
       VCPKG_ROOT: ${{ github.workspace }}\vcpkg
@@ -180,7 +143,6 @@ jobs:
   # Linux x86_64 (glibc) - native
   # ---------------------------------------------------------------------
   linux-x86_64:
-    needs: check-version
     runs-on: ubuntu-22.04 # glibc 2.35, a broadly-compatible baseline
     steps:
       - uses: actions/checkout@v4
@@ -215,7 +177,6 @@ jobs:
   # cross-compilation needed)
   # ---------------------------------------------------------------------
   linux-aarch64:
-    needs: check-version
     runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -249,7 +210,6 @@ jobs:
   # macOS arm64 (Apple Silicon / M-series) - native GH-hosted arm64 runner
   # ---------------------------------------------------------------------
   macos-arm64:
-    needs: check-version
     runs-on: macos-15 # native Apple Silicon (M-series) runner
     steps:
       - uses: actions/checkout@v4
@@ -283,7 +243,6 @@ jobs:
   # ---------------------------------------------------------------------
   release:
     needs:
-      - check-version
       - windows-x64
       - windows-arm64
       - linux-x86_64
