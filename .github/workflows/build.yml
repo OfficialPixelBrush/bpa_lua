@@ -144,8 +144,6 @@ jobs:
   # ---------------------------------------------------------------------
   release:
     needs:
-      - windows-x64
-      - windows-arm64
       - linux-x86_64
       - linux-aarch64
       - macos-arm64
