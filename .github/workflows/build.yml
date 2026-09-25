@@ -1,0 +1,90 @@
+name: Build
+
+jobs:
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblua5.4-dev pkg-config
+
+      - name: Build
+        run: g++ -std=c++17 -shared -fPIC src/bpa_lua.cpp -o bpa_lua.so $(pkg-config --cflags --libs lua5.4)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bpa_lua-linux-x86_64
+          path: bpa_lua.so
+          if-no-files-found: error
+
+  macos:
+    name: macOS (arm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua
+        run: brew install lua pkg-config
+
+      - name: Build
+        run: g++ -std=c++17 -shared -fPIC -undefined dynamic_lookup src/bpa_lua.cpp -o bpa_lua.so $(pkg-config --cflags --libs lua5.4)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bpa_lua-macos-arm64
+          path: bpa_lua.so
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-lua mingw-w64-x86_64-pkg-config
+
+      - name: Build
+        run: g++ -std=c++17 -shared src/bpa_lua.cpp -o bpa_lua.dll $(pkg-config --cflags --libs lua5.4)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bpa_lua-windows-x86_64
+          path: bpa_lua.dll
+          if-no-files-found: error
+
+  release:
+    name: Attach binaries to release
+    needs: [linux, macos, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package artifacts
+        run: |
+          mkdir -p release
+          for dir in artifacts/*/; do
+            name=$(basename "$dir")
+            (cd "$dir" && zip -r "../../release/${name}.zip" .)
+          done
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.zip

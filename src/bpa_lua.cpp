@@ -521,7 +521,7 @@ extern "C" bp_addon_info bp_addon(const bp_api* /*api*/) {
     return bp_addon_info{
         "bpa_lua",
         "Lua",
-        "1.0",
+        "0.0.1",
         bp_addon_events{
             /* playerJoin   */ bpa::OnPlayerJoin,
             /* playerLeave  */ bpa::OnPlayerLeave,
