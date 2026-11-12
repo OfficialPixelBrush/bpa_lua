@@ -1,9 +1,9 @@
 name: Build & Release Addon
 
-# Manual-only. Builds the bpa_luau addon for 5 targets and publishes one
+# Manual-only. Builds the bpa_lua addon for 5 targets and publishes one
 # GitHub Release with all the binaries attached.
 #
-# Luau is fetched and built from source by CMake (see CMakeLists.txt) and linked
+# Lua is fetched and built from source by CMake (see CMakeLists.txt) and linked
 # statically into the addon, so the release archives have no runtime dependencies.
 on:
   workflow_dispatch:
@@ -29,18 +29,18 @@ on:
         default: false
 
 env:
-  ADDON_NAME: bpa_luau
+  ADDON_NAME: bpa_lua
 
 permissions:
   contents: write
 
 concurrency:
-  group: build-release-bpa-luau-${{ github.run_id }}
+  group: build-release-bpa-lua-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
   # ---------------------------------------------------------------------
-  # Sanity check: tag_name must match ADDON_VERSION in src/bpa_luau.cpp
+  # Sanity check: tag_name must match ADDON_VERSION in src/bpa_lua.cpp
   # ---------------------------------------------------------------------
   check-version:
     runs-on: ubuntu-latest
@@ -53,10 +53,10 @@ jobs:
           TAG="${{ inputs.tag_name }}"
           TAG_VERSION="${TAG#v}"  # strip a leading "v" (v0.1.0 -> 0.1.0)
 
-          ADDON_VERSION=$(sed -nE 's/.*ADDON_VERSION[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' src/bpa_luau.cpp | head -n1)
+          ADDON_VERSION=$(sed -nE 's/.*ADDON_VERSION[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' src/bpa_lua.cpp | head -n1)
 
           if [ -z "$ADDON_VERSION" ]; then
-            echo "::error::Could not find ADDON_VERSION in src/bpa_luau.cpp"
+            echo "::error::Could not find ADDON_VERSION in src/bpa_lua.cpp"
             exit 1
           fi
 
@@ -65,7 +65,7 @@ jobs:
           echo "addon version: $ADDON_VERSION"
 
           if [ "$TAG_VERSION" != "$ADDON_VERSION" ]; then
-            echo "::error::tag_name '${TAG}' implies version '${TAG_VERSION}', but src/bpa_luau.cpp has ADDON_VERSION '${ADDON_VERSION}'. Bump ADDON_VERSION or fix the tag before releasing."
+            echo "::error::tag_name '${TAG}' implies version '${TAG_VERSION}', but src/bpa_lua.cpp has ADDON_VERSION '${ADDON_VERSION}'. Bump ADDON_VERSION or fix the tag before releasing."
             exit 1
           fi
 
@@ -88,7 +88,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --target bpa_luau --parallel
+        run: cmake --build build --target bpa_lua --parallel
 
       - name: Package
         shell: pwsh
@@ -125,7 +125,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --target bpa_luau --parallel
+        run: cmake --build build --target bpa_lua --parallel
 
       - name: Package
         shell: pwsh
@@ -161,7 +161,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --target bpa_luau -j"$(nproc)"
+        run: cmake --build build --target bpa_lua -j"$(nproc)"
 
       - name: Package
         run: |
@@ -195,7 +195,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --target bpa_luau -j"$(nproc)"
+        run: cmake --build build --target bpa_lua -j"$(nproc)"
 
       - name: Package
         run: |
@@ -230,7 +230,7 @@ jobs:
             -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
 
       - name: Build
-        run: cmake --build build --target bpa_luau -j"$(sysctl -n hw.ncpu)"
+        run: cmake --build build --target bpa_lua -j"$(sysctl -n hw.ncpu)"
 
       - name: Package
         run: |

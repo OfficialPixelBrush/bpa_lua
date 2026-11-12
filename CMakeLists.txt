@@ -1,39 +1,48 @@
 cmake_minimum_required(VERSION 3.16)
-project(bpa_luau LANGUAGES CXX)
+project(bpa_lua LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Luau is built from source and linked statically into the addon, so there is
+# Lua is built from source and linked statically into the addon, so there is
 # no runtime dependency on it. To use a local checkout instead of downloading:
-#   cmake -B build -DFETCHCONTENT_SOURCE_DIR_LUAU=/path/to/luau
+#   cmake -B build -DFETCHCONTENT_SOURCE_DIR_LUA=/path/to/lua
 include(FetchContent)
-if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.28)
-    # Only build the Luau targets we actually link (VM, Compiler, Ast, ...).
-    FetchContent_Declare(
-        luau
-        GIT_REPOSITORY https://github.com/luau-lang/luau.git
-        GIT_TAG        0.743
-        GIT_SHALLOW    TRUE
-        EXCLUDE_FROM_ALL
-    )
-else()
-    FetchContent_Declare(
-        luau
-        GIT_REPOSITORY https://github.com/luau-lang/luau.git
-        GIT_TAG        0.743
-        GIT_SHALLOW    TRUE
-    )
-endif()
-set(LUAU_BUILD_CLI   OFF CACHE BOOL "" FORCE)
-set(LUAU_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(LUAU_BUILD_WEB   OFF CACHE BOOL "" FORCE)
-set(LUAU_WERROR      OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(luau)
+FetchContent_Declare(
+    lua
+    GIT_REPOSITORY https://github.com/lua/lua.git
+    GIT_TAG        v5.4.8
+    GIT_SHALLOW    TRUE
+)
+# The upstream repo ships no CMakeLists.txt, so this only downloads the sources.
+FetchContent_MakeAvailable(lua)
 
-add_library(bpa_luau MODULE src/bpa_luau.cpp)
-target_link_libraries(bpa_luau PRIVATE Luau.VM Luau.Compiler)
-target_compile_options(bpa_luau PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-fvisibility=hidden>)
+# Everything in the core + standard libraries; lua.c (the CLI) and luac.c are left out.
+set(LUA_SOURCES
+    lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c llex.c lmem.c
+    lobject.c lopcodes.c lparser.c lstate.c lstring.c ltable.c ltm.c lundump.c
+    lvm.c lzio.c
+    lauxlib.c lbaselib.c lcorolib.c ldblib.c linit.c liolib.c lmathlib.c
+    loadlib.c loslib.c lstrlib.c ltablib.c lutf8lib.c
+)
+list(TRANSFORM LUA_SOURCES PREPEND "${lua_SOURCE_DIR}/")
+
+add_library(lua_core STATIC ${LUA_SOURCES})
+target_include_directories(lua_core PUBLIC "${lua_SOURCE_DIR}")
+# Keep Lua's symbols private to the addon so they can't clash with the host or other addons.
+set_target_properties(lua_core PROPERTIES C_VISIBILITY_PRESET hidden)
+if(UNIX)
+    # io.popen, os.tmpname, etc. plus dlopen for package.loadlib / C modules.
+    target_compile_definitions(lua_core PRIVATE LUA_USE_POSIX LUA_USE_DLOPEN)
+    target_link_libraries(lua_core PUBLIC ${CMAKE_DL_LIBS})
+endif()
+if(MSVC)
+    target_compile_definitions(lua_core PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_library(bpa_lua MODULE src/bpa_lua.cpp)
+target_link_libraries(bpa_lua PRIVATE lua_core)
+target_compile_options(bpa_lua PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-fvisibility=hidden>)
 # bp_addon() is exported explicitly in the source.
-set_target_properties(bpa_luau PROPERTIES PREFIX "")
+set_target_properties(bpa_lua PROPERTIES PREFIX "")

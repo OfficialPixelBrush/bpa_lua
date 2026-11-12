@@ -55,4 +55,3 @@ dkms.conf
 *.dwo
 /build
 *.zip
-/luau

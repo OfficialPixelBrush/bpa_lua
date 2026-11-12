@@ -2,14 +2,14 @@ extern "C" {
 #include "addon_api.h"
 }
 
-// Luau's headers already declare their API with C linkage, so they must not
-// be wrapped in extern "C" here.
+// Stock Lua's headers have no C++ guards, so they need the extern "C" wrapper.
+extern "C" {
 #include <lua.h>
+#include <lauxlib.h>
 #include <lualib.h>
-#include <luacode.h>
+}
 
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -21,11 +21,11 @@ extern "C" {
 namespace bpa {
 namespace {
 
-constexpr const char* ADDON_ID = "bpa_luau";
-constexpr const char* ADDON_NAME = "Luau";
+constexpr const char* ADDON_ID = "bpa_lua";
+constexpr const char* ADDON_NAME = "Lua";
 constexpr const char* ADDON_VERSION = "0.1.1"; // keep in sync with the release tag (checked by CI)
 
-constexpr const char* scriptsDir = "luau";
+constexpr const char* scriptsDir = "lua";
 
 const bp_api* g_api = nullptr;
 bp_world* g_world = nullptr; // Best-effort fallback world, kept fresh by any event/call that hands us one.
@@ -63,11 +63,9 @@ private:
     lua_State* L_ = nullptr;
 };
 
-// Each plugin owns an isolated Luau VM
+// Each plugin owns an isolated Lua VM; scripts run directly on its main thread.
 struct Plugin {
-    LuaState state;            // main thread, owns the VM
-    lua_State* script = nullptr; // sandboxed thread that scripts run on
-    int scriptRef = LUA_NOREF; // keeps `script` alive across GC
+    LuaState state;
     std::string name;
 };
 
@@ -76,6 +74,21 @@ std::vector<Plugin> g_plugins;
 void* checkHandle(lua_State* L, int idx, const char* what) {
     luaL_argcheck(L, lua_islightuserdata(L, idx), idx, what);
     return lua_touserdata(L, idx);
+}
+
+// Error values aren't always strings (error({}) etc.), and lua_tostring would
+// hand a null pointer to the logger.
+const char* errorMessage(lua_State* L) {
+    const char* msg = lua_tostring(L, -1);
+    return msg ? msg : "(non-string error object)";
+}
+
+// Accepts any number and truncates it, so scripts can pass float coordinates
+// straight through (luaL_checkinteger would raise on a fractional value).
+int32_t checkInt32(lua_State* L, int idx) {
+    lua_Number n = luaL_checknumber(L, idx);
+    luaL_argcheck(L, n >= -2147483648.0 && n <= 2147483647.0, idx, "number out of range");
+    return static_cast<int32_t>(n);
 }
 
 bool getGlobalFunction(lua_State* L, const char* name) {
@@ -89,7 +102,7 @@ bool getGlobalFunction(lua_State* L, const char* name) {
 
 bool callWithReport(lua_State* L, int nargs, int nresults) {
     if (lua_pcall(L, nargs, nresults, 0) != LUA_OK) {
-        g_api->log.error(g_api, lua_tostring(L, -1));
+        g_api->log.error(g_api, errorMessage(L));
         lua_pop(L, 1);
         return false;
     }
@@ -146,7 +159,7 @@ int lua_server_getPlayerCount(lua_State* L) {
     return 1;
 }
 int lua_server_getPlayerAt(lua_State* L) {
-    int index = static_cast<int>(luaL_checkinteger(L, 1));
+    int index = checkInt32(L, 1);
     bp_player* player = g_api->server.getPlayerAt(g_api, index);
     if (!player) { lua_pushnil(L); return 1; }
     lua_pushlightuserdata(L, player);
@@ -226,9 +239,9 @@ int lua_entity_getWorld(lua_State* L) {
 int lua_world_getBlock(lua_State* L) {
     bp_world* world = static_cast<bp_world*>(checkHandle(L, 1, "Expected a world handle"));
     bp_block_pos bpos;
-    bpos.x = static_cast<int32_t>(luaL_checkinteger(L, 2));
-    bpos.y = static_cast<int32_t>(luaL_checkinteger(L, 3));
-    bpos.z = static_cast<int32_t>(luaL_checkinteger(L, 4));
+    bpos.x = checkInt32(L, 2);
+    bpos.y = checkInt32(L, 3);
+    bpos.z = checkInt32(L, 4);
 
     bp_block block = g_api->world.getBlock(world, bpos);
     pushBlock(L, block);
@@ -237,13 +250,13 @@ int lua_world_getBlock(lua_State* L) {
 int lua_world_setBlock(lua_State* L) {
     bp_world* world = static_cast<bp_world*>(checkHandle(L, 1, "Expected a world handle"));
     bp_block_pos bpos;
-    bpos.x = static_cast<int32_t>(luaL_checkinteger(L, 2));
-    bpos.y = static_cast<int32_t>(luaL_checkinteger(L, 3));
-    bpos.z = static_cast<int32_t>(luaL_checkinteger(L, 4));
+    bpos.x = checkInt32(L, 2);
+    bpos.y = checkInt32(L, 3);
+    bpos.z = checkInt32(L, 4);
 
     bp_block block;
-    block.id = static_cast<int8_t>(luaL_checkinteger(L, 5));
-    block.meta = static_cast<uint8_t>(luaL_checkinteger(L, 6));
+    block.id = static_cast<int8_t>(checkInt32(L, 5));
+    block.meta = static_cast<uint8_t>(checkInt32(L, 6));
 
     g_api->world.setBlock(world, bpos, block);
     return 0;
@@ -253,13 +266,13 @@ int lua_world_sendBlockUpdate(lua_State* L) {
     // without changing world state server-side.
     bp_world* world = static_cast<bp_world*>(checkHandle(L, 1, "Expected a world handle"));
     bp_block_pos bpos;
-    bpos.x = static_cast<int32_t>(luaL_checkinteger(L, 2));
-    bpos.y = static_cast<int32_t>(luaL_checkinteger(L, 3));
-    bpos.z = static_cast<int32_t>(luaL_checkinteger(L, 4));
+    bpos.x = checkInt32(L, 2);
+    bpos.y = checkInt32(L, 3);
+    bpos.z = checkInt32(L, 4);
 
     bp_block block;
-    block.id = static_cast<int8_t>(luaL_checkinteger(L, 5));
-    block.meta = static_cast<uint8_t>(luaL_checkinteger(L, 6));
+    block.id = static_cast<int8_t>(checkInt32(L, 5));
+    block.meta = static_cast<uint8_t>(checkInt32(L, 6));
 
     g_api->world.sendBlockUpdate(world, bpos, block);
     return 0;
@@ -275,7 +288,11 @@ int lua_world_getCurrent(lua_State* L) {
 int lua_data_setPlayer(lua_State* L) {
     bp_player* player = static_cast<bp_player*>(checkHandle(L, 1, "Expected a player handle"));
     luaL_checkany(L, 2);
-    int ref = lua_ref(L, 2); // does not pop; nil yields LUA_REFNIL (0), which reads back as nil
+    // luaL_ref pops its value, so push a copy. Stored as a plain integer in the
+    // pointer slot; nil stores nullptr, which getPlayer reads back as nil.
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    if (ref == LUA_REFNIL) ref = 0;
     g_api->data.setPlayer(g_api, player, reinterpret_cast<void*>(static_cast<intptr_t>(ref)));
     return 0;
 }
@@ -283,7 +300,7 @@ int lua_data_getPlayer(lua_State* L) {
     bp_player* player = static_cast<bp_player*>(checkHandle(L, 1, "Expected a player handle"));
     void* raw = g_api->data.getPlayer(g_api, player);
     if (!raw) { lua_pushnil(L); return 1; }
-    lua_getref(L, static_cast<int>(reinterpret_cast<intptr_t>(raw)));
+    lua_rawgeti(L, LUA_REGISTRYINDEX, static_cast<lua_Integer>(reinterpret_cast<intptr_t>(raw)));
     return 1;
 }
 
@@ -349,7 +366,7 @@ const luaL_Reg lua_commands_fns[] = {
 
 void registerLib(lua_State* L, const char* name, const luaL_Reg* fns) {
     lua_newtable(L);
-    luaL_register(L, nullptr, fns); // libname == NULL: fill the table on top of the stack
+    luaL_setfuncs(L, fns, 0);
     lua_setglobal(L, name);
 }
 
@@ -372,37 +389,28 @@ bool readFile(const std::filesystem::path& path, std::string& out) {
     return true;
 }
 
-bool loadAndRun(lua_State* L, const std::string& source, const std::string& chunkName) {
-    lua_CompileOptions opts = {};
-    opts.optimizationLevel = 1; // baseline optimizations that don't hinder debugging
-    opts.debugLevel = 1;        // line info, so runtime errors report file:line
+bool loadAndRun(lua_State* L, std::string source, const std::string& chunkName) {
+    // Editors on Windows like to prepend a UTF-8 BOM, which the Lua lexer rejects.
+    if (source.compare(0, 3, "\xEF\xBB\xBF") == 0) source.erase(0, 3);
 
-    size_t bytecodeSize = 0;
-    char* bytecode = luau_compile(source.data(), source.size(), &opts, &bytecodeSize);
-    int status = luau_load(L, chunkName.c_str(), bytecode, bytecodeSize, 0);
-    std::free(bytecode);
-    if (status != 0) return false; // compile/load error message is on the stack
-
+    // Text chunks only; precompiled bytecode isn't accepted from script files.
+    if (luaL_loadbufferx(L, source.data(), source.size(), chunkName.c_str(), "t") != LUA_OK) {
+        return false; // syntax error message is on the stack
+    }
     return lua_pcall(L, 0, 0, 0) == LUA_OK;
 }
 
 void loadPluginFile(const std::filesystem::path& path) {
     lua_State* raw = luaL_newstate();
     if (!raw) {
-        g_api->log.error(g_api, "Failed to create Luau state");
+        g_api->log.error(g_api, "Failed to create Lua state");
         return;
     }
     LuaState state(raw);
 
+    // Full standard library (io, os, package, ...); scripts are not sandboxed.
     luaL_openlibs(raw);
     registerApi(raw);
-
-    // Lock down the standard library and our API tables
-    luaL_sandbox(raw);
-    lua_State* script = lua_newthread(raw);
-    luaL_sandboxthread(script);
-    int scriptRef = lua_ref(raw, -1); // anchor the thread so GC can't collect it
-    lua_pop(raw, 1);
 
     std::string source;
     if (!readFile(path, source)) {
@@ -412,9 +420,9 @@ void loadPluginFile(const std::filesystem::path& path) {
     }
 
     std::string name = path.filename().string();
-    if (!loadAndRun(script, source, "@" + name)) {
-        g_api->log.error(g_api, lua_tostring(script, -1));
-        return; // `state` destructor closes the Luau VM
+    if (!loadAndRun(raw, std::move(source), "@" + name)) {
+        g_api->log.error(g_api, errorMessage(raw));
+        return; // `state` destructor closes the Lua VM
     }
 
     std::string msg = "Loaded plugin '" + name + "'";
@@ -422,8 +430,6 @@ void loadPluginFile(const std::filesystem::path& path) {
 
     Plugin plugin;
     plugin.state = std::move(state);
-    plugin.script = script;
-    plugin.scriptRef = scriptRef;
     plugin.name = std::move(name);
     g_plugins.push_back(std::move(plugin));
 }
@@ -431,22 +437,22 @@ void loadPluginFile(const std::filesystem::path& path) {
 void loadAllPlugins() {
     std::error_code ec;
     if (!std::filesystem::is_directory(scriptsDir, ec)) {
-        g_api->log.warning(g_api, "No 'luau' directory found, no plugins loaded");
+        g_api->log.warning(g_api, "No 'lua' directory found, no plugins loaded");
         return;
     }
 
     for (const auto& entry : std::filesystem::directory_iterator(scriptsDir, ec)) {
         if (!entry.is_regular_file()) continue;
-        const auto ext = entry.path().extension();
-        if (ext != ".luau" && ext != ".lua") continue;
+        if (entry.path().extension() != ".lua") continue;
         loadPluginFile(entry.path());
     }
 }
 
 void unloadAllPlugins() {
     for (auto& plugin : g_plugins) {
-        if (getGlobalFunction(plugin.script, "OnUnload")) {
-            callWithReport(plugin.script, 0, 0);
+        lua_State* L = plugin.state.get();
+        if (getGlobalFunction(L, "OnUnload")) {
+            callWithReport(L, 0, 0);
         }
     }
     g_plugins.clear(); // each Plugin's LuaState destructor closes its lua_State
@@ -457,7 +463,7 @@ extern "C" {
 
 void OnPlayerJoin(const bp_api* /*api*/, const bp_player_join_event* ev) {
     for (auto& plugin : g_plugins) {
-        lua_State* L = plugin.script;
+        lua_State* L = plugin.state.get();
         if (!getGlobalFunction(L, "OnPlayerJoin")) continue;
 
         lua_pushlightuserdata(L, ev->player);
@@ -467,7 +473,7 @@ void OnPlayerJoin(const bp_api* /*api*/, const bp_player_join_event* ev) {
 
 void OnPlayerLeave(const bp_api* /*api*/, const bp_player_leave_event* ev) {
     for (auto& plugin : g_plugins) {
-        lua_State* L = plugin.script;
+        lua_State* L = plugin.state.get();
         if (!getGlobalFunction(L, "OnPlayerLeave")) continue;
 
         lua_pushlightuserdata(L, ev->player);
@@ -477,7 +483,7 @@ void OnPlayerLeave(const bp_api* /*api*/, const bp_player_leave_event* ev) {
 
 void OnPlayerMove(const bp_api* /*api*/, bp_player_move_event* ev) {
     for (auto& plugin : g_plugins) {
-        lua_State* L = plugin.script;
+        lua_State* L = plugin.state.get();
         if (!getGlobalFunction(L, "OnPlayerMove")) continue;
 
         lua_pushlightuserdata(L, ev->player);
@@ -491,7 +497,7 @@ void OnPlayerMove(const bp_api* /*api*/, bp_player_move_event* ev) {
 
 void OnItemUse(const bp_api* /*api*/, bp_item_use_event* ev) {
     for (auto& plugin : g_plugins) {
-        lua_State* L = plugin.script;
+        lua_State* L = plugin.state.get();
         if (!getGlobalFunction(L, "OnItemUse")) continue;
 
         lua_pushlightuserdata(L, ev->player);
@@ -506,7 +512,7 @@ void OnBlockUse(const bp_api* /*api*/, bp_block_use_event* ev) {
     g_world = ev->world; // fallback world context, kept fresh here too
 
     for (auto& plugin : g_plugins) {
-        lua_State* L = plugin.script;
+        lua_State* L = plugin.state.get();
         if (!getGlobalFunction(L, "OnBlockUse")) continue;
 
         lua_pushlightuserdata(L, ev->player);
@@ -524,7 +530,7 @@ void OnBlockBreak(const bp_api* /*api*/, bp_block_break_event* ev) {
     g_world = ev->world; // fallback world context, kept fresh here too
 
     for (auto& plugin : g_plugins) {
-        lua_State* L = plugin.script;
+        lua_State* L = plugin.state.get();
         if (!getGlobalFunction(L, "OnBlockBreak")) continue;
 
         lua_pushlightuserdata(L, ev->player);
@@ -544,7 +550,7 @@ void OnBlockPlace(const bp_api* /*api*/, bp_block_place_event* ev) {
     g_world = ev->world; // fallback world context, kept fresh here too
 
     for (auto& plugin : g_plugins) {
-        lua_State* L = plugin.script;
+        lua_State* L = plugin.state.get();
         if (!getGlobalFunction(L, "OnBlockPlace")) continue;
 
         lua_pushlightuserdata(L, ev->player);
@@ -561,7 +567,7 @@ void OnBlockPlace(const bp_api* /*api*/, bp_block_place_event* ev) {
 
 void OnEntityDamage(const bp_api* /*api*/, bp_entity_damage_event* ev) {
     for (auto& plugin : g_plugins) {
-        lua_State* L = plugin.script;
+        lua_State* L = plugin.state.get();
         if (!getGlobalFunction(L, "OnEntityDamage")) continue;
 
         lua_pushlightuserdata(L, ev->entity);
@@ -574,7 +580,7 @@ void OnEntityDamage(const bp_api* /*api*/, bp_entity_damage_event* ev) {
 
 void OnServerTick(const bp_api* /*api*/, const bp_server_tick_event* /*ev*/) {
     for (auto& plugin : g_plugins) {
-        lua_State* L = plugin.script;
+        lua_State* L = plugin.state.get();
         if (!getGlobalFunction(L, "OnServerTick")) continue;
         callWithReport(L, 0, 0);
     }
@@ -582,7 +588,7 @@ void OnServerTick(const bp_api* /*api*/, const bp_server_tick_event* /*ev*/) {
 
 void OnPlayerChat(const bp_api* /*api*/, bp_player_chat_event* ev) {
     for (auto& plugin : g_plugins) {
-        lua_State* L = plugin.script;
+        lua_State* L = plugin.state.get();
         if (!getGlobalFunction(L, "OnPlayerChat")) continue;
 
         lua_pushlightuserdata(L, ev->player);
@@ -597,7 +603,7 @@ void OnPlayerChat(const bp_api* /*api*/, bp_player_chat_event* ev) {
 // any field the server doesn't provide arrives as nil. Nothing can be cancelled.
 void OnCrash(const bp_api* /*api*/, const bp_crash_event* ev) {
     for (auto& plugin : g_plugins) {
-        lua_State* L = plugin.script;
+        lua_State* L = plugin.state.get();
         if (!getGlobalFunction(L, "OnCrash")) continue;
 
         lua_pushstring(L, ev->crash_log);
@@ -612,14 +618,14 @@ void OnLoad(const bp_api* api, const bp_addon_load* /*ev*/) {
 
     loadAllPlugins();
 
-    std::string msg = "Luau initialized! (" +
+    std::string msg = "Lua initialized! (" +
         std::to_string(g_plugins.size()) + " plugin(s) loaded)";
     api->log.info(api, msg.c_str());
 }
 
 void OnUnload(const bp_api* api, const bp_addon_unload* /*ev*/) {
     unloadAllPlugins();
-    api->log.info(api, "Luau uninitialized!");
+    api->log.info(api, "Lua uninitialized!");
 }
 
 } // extern "C"
