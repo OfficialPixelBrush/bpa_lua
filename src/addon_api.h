@@ -16,12 +16,16 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define ADDON_API_VERSION 1
+//TODO: Turn into function call,
+// as definitions don't exist outside of the C preprocessor
+#define ADDON_API_VERSION 4
 
 typedef struct bp_api bp_api;
 typedef struct bp_player bp_player;
 typedef struct bp_entity bp_entity;
 typedef struct bp_world bp_world;
+typedef struct bp_cmd_node bp_cmd_node;
+typedef struct bp_cmd_action_ctx bp_cmd_action_ctx;
 
 typedef struct {
 	double x;
@@ -45,6 +49,48 @@ typedef struct {
 	int8_t id;
 	uint8_t meta;
 } bp_block;
+
+typedef enum {
+	BP_DAMAGE_NONE,
+	BP_DAMAGE_FALL,
+	BP_DAMAGE_DROWN,
+	BP_DAMAGE_BURN,
+	BP_DAMAGE_LAVA,
+	BP_DAMAGE_PUNCH,
+	BP_DAMAGE_ARROW,
+	BP_DAMAGE_EXPLOSION,
+	BP_DAMAGE_LIGHTNING,
+	BP_DAMAGE_SUFFOCATION,
+	BP_DAMAGE_COMMAND,
+	BP_DAMAGE_VOID,
+	BP_DAMAGE_CACTUS,
+	BP_DAMAGE_ITEM
+} bp_damage_type;
+
+typedef enum {
+	BP_CMD_LITERAL,
+	BP_CMD_STRING,
+	BP_CMD_GREEDY_STRING,
+	BP_CMD_INTEGER,
+	BP_CMD_FLOAT,
+	BP_CMD_BOOLEAN,
+	BP_CMD_ENUM,
+	BP_CMD_VEC3,
+} bp_cmd_node_type;
+
+typedef enum {
+	BP_AXIS_X,
+	BP_AXIS_Y,
+	BP_AXIS_Z,
+} bp_axis;
+
+typedef struct {
+	float pos[3];
+	//TODO: Maybe some helper macros or inline implementation functions for this?
+	uint8_t relativeAxes; // bitmask
+} bp_cmd_vec3;
+
+typedef void (*bp_cmd_action_fn)(const bp_api* api, const bp_cmd_action_ctx* ctx);
 
 struct bp_api {
 	uint32_t version;
@@ -77,6 +123,7 @@ struct bp_api {
 		bp_vec3 (*getPosition)(bp_entity* entity);
 		void (*setPosition)(bp_entity* entity, bp_vec3 position);
 		bp_world* (*getWorld)(bp_entity* entity);
+		bp_player* (*toPlayer)(bp_entity* entity); // Only works if the entity is a player, of course, NULL otherwise
 	} entity;
 
 	struct {
@@ -86,13 +133,23 @@ struct bp_api {
 	} world;
 
 	struct {
-		void (*setPlayer)(const bp_api* api, bp_player* player, void* _data);
-		void* (*getPlayer)(const bp_api* api, bp_player* player);
-	} data;
-
-	struct {
-		bool (*execute)(const bp_api* api, bp_player* sender, const char* command);
-	} commands;
+		bp_cmd_node* (*makeNode)(const char* name, bp_cmd_node_type type);
+		bp_cmd_node* (*makeIntegerEx)(const char* name, int min, int max);
+		bp_cmd_node* (*makeFloatEx)(const char* name, float min, float max);
+		bp_cmd_node* (*makeEnum)(const char* name, const char* values[]); // Null-terminated array
+		void (*addChild)(bp_cmd_node* parent, bp_cmd_node* child);
+		void (*sendActionFeedback)(const bp_cmd_action_ctx* ctx, const char* message);
+		bp_entity* (*getActionExecutor)(const bp_cmd_action_ctx* ctx); // Might return NULL (e.g. console runs)
+		bool (*getStringArg)(const bp_cmd_action_ctx* ctx, const char* name, const char** out);
+		bool (*getIntegerArg)(const bp_cmd_action_ctx* ctx, const char* name, int* out);
+		bool (*getFloatArg)(const bp_cmd_action_ctx* ctx, const char* name, float* out);
+		bool (*getBooleanArg)(const bp_cmd_action_ctx* ctx, const char* name, bool* out);
+		bool (*getEnumArg)(const bp_cmd_action_ctx* ctx, const char* name, const char** out);
+		bool (*getVec3Arg)(const bp_cmd_action_ctx* ctx, const char* name, bp_cmd_vec3* out);
+		void (*setAction)(const bp_api* api, bp_cmd_node* node, bp_cmd_action_fn action);
+		void (*registerCommand)(const bp_api* api, bp_cmd_node* root);
+		bool (*execute)(const bp_api* api, bp_player* sender, const char* cmdline);
+	} cmd;
 };
 
 typedef struct {
@@ -107,20 +164,23 @@ typedef struct {
 	bp_player* player;
 	const char* message;
 
+	// --- Modifiable fields ---
 	bool cancel;
 } bp_player_chat_event;
 
 typedef struct {
 	bp_player* player;
+
+	// --- Modifiable fields ---
 	bp_vec3 from;
 	bp_vec3 to;
-
 	bool cancel;
 } bp_player_move_event;
 
 typedef struct {
 	bp_player* player;
 
+	// --- Modifiable fields ---
 	bp_item_stack item;
 	bool cancel;
 } bp_item_use_event;
@@ -129,6 +189,7 @@ typedef struct {
 	bp_player* player;
 	bp_world* world;
 
+	// --- Modifiable fields ---
 	bp_item_stack heldItem;
 	bp_block_pos blockPos;
 	bp_block block;
@@ -139,6 +200,7 @@ typedef struct {
 	bp_player* player;
 	bp_world* world;
 
+	// --- Modifiable fields ---
 	bp_item_stack tool;
 	bp_block_pos blockPos;
 	bp_block block;
@@ -149,6 +211,7 @@ typedef struct {
 	bp_player* player;
 	bp_world* world;
 
+	// --- Modifiable fields ---
 	bp_block_pos blockPos;
 	int8_t blockId;
 	bool cancel;
@@ -156,8 +219,11 @@ typedef struct {
 
 typedef struct {
 	bp_entity* entity;
+	bp_entity* attacker; // Can be NULL
 
+	// --- Modifiable fields ---
 	int amount;
+	bp_damage_type type;
 	bool cancel;
 } bp_entity_damage_event;
 
