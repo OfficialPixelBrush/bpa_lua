@@ -9,7 +9,7 @@ extern "C" {
 #include <lualib.h>
 }
 
-#include <array>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -26,7 +26,7 @@ namespace {
 
 constexpr const char* ADDON_ID = "bpa_lua";
 constexpr const char* ADDON_NAME = "Lua";
-constexpr const char* ADDON_VERSION = "0.2.0"; // keep in sync with the release tag (checked by CI)
+constexpr const char* ADDON_VERSION = "0.2.1"; // keep in sync with the release tag (checked by CI)
 
 constexpr const char* scriptsDir = "lua";
 
@@ -183,42 +183,7 @@ void clearPlayerData(lua_State* L, bp_player* player) {
 }
 
 // --- Command support ---------------------------------------------------------
-// bp_cmd_action_fn carries no user pointer and the action context doesn't say
-// which node fired, so every Lua action gets its own pre-instantiated C
-// trampoline that finds its Lua function through a fixed slot table.
-// (Trampolines are templates, so they have C++ linkage; every supported
-// compiler accepts them as C function pointers.)
-constexpr size_t MAX_COMMAND_ACTIONS = 256;
 
-struct ActionSlot {
-    lua_State* L = nullptr;
-    int ref = LUA_NOREF;
-};
-
-ActionSlot g_actionSlots[MAX_COMMAND_ACTIONS];
-size_t g_actionSlotsUsed = 0; // never rewound: the host may keep old nodes/trampolines alive
-std::unordered_map<bp_cmd_node*, size_t> g_nodeSlots;
-
-void dispatchAction(size_t slot, const bp_cmd_action_ctx* ctx) {
-    ActionSlot& s = g_actionSlots[slot];
-    if (!s.L) return; // owning plugin has been unloaded
-    lua_rawgeti(s.L, LUA_REGISTRYINDEX, s.ref);
-    lua_pushlightuserdata(s.L, const_cast<bp_cmd_action_ctx*>(ctx));
-    callWithReport(s.L, 1, 0);
-}
-
-template <size_t N>
-void actionTrampoline(const bp_api* /*api*/, const bp_cmd_action_ctx* ctx) {
-    dispatchAction(N, ctx);
-}
-
-template <size_t... Is>
-std::array<bp_cmd_action_fn, sizeof...(Is)> makeTrampolines(std::index_sequence<Is...>) {
-    return {{ &actionTrampoline<Is>... }};
-}
-
-const std::array<bp_cmd_action_fn, MAX_COMMAND_ACTIONS> g_trampolines =
-    makeTrampolines(std::make_index_sequence<MAX_COMMAND_ACTIONS>{});
 
 // The host may keep the `const char*` names and enum value arrays we hand it
 // without copying, so everything passed to the cmd API lives for the whole
@@ -231,8 +196,91 @@ const char* intern(const char* s) {
     return g_strings.back().c_str();
 }
 
+// Name + null-terminated value array of an enum argument visible to an action.
+using EnumScope = std::vector<std::pair<const char*, const std::vector<const char*>*>>;
+
+struct Action {
+    lua_State* L = nullptr;   // owning VM's main thread; null once detached
+    int ref = LUA_NOREF;      // registry reference to the Lua callback
+    EnumScope enums;          // filled in when the command tree is registered
+};
+
+// Never shrunk: the host may keep old nodes (and our userData pointers) alive
+// after an unload, so Action records must outlive everything.
+std::deque<Action> g_actions;
+const Action* g_currentAction = nullptr; // the action being dispatched (actions can nest via commands.execute)
+
+// Build-time bookkeeping for command nodes that haven't been registered yet.
+struct NodeInfo {
+    const char* name = nullptr;
+    const std::vector<const char*>* enumValues = nullptr; // set for enum nodes only
+    std::vector<bp_cmd_node*> children;
+    Action* action = nullptr;
+};
+std::unordered_map<bp_cmd_node*, NodeInfo> g_nodes;
+
+void detachActions(lua_State* L) {
+    for (Action& a : g_actions) {
+        if (a.L == L) {
+            a.L = nullptr;
+            a.ref = LUA_NOREF;
+        }
+    }
+}
+
+void resolveTree(bp_cmd_node* node, std::vector<bp_cmd_node*>& path, EnumScope& scope,
+                 std::vector<bp_cmd_node*>& visited) {
+    if (std::find(path.begin(), path.end(), node) != path.end()) return; // cycle guard
+    auto it = g_nodes.find(node);
+    if (it == g_nodes.end()) return;
+    NodeInfo& info = it->second; // no inserts happen during the walk, so this stays valid
+
+    visited.push_back(node);
+    path.push_back(node);
+    const size_t scopeSize = scope.size();
+    if (info.enumValues) scope.emplace_back(info.name, info.enumValues);
+    if (info.action) info.action->enums = scope;
+    for (bp_cmd_node* child : info.children) resolveTree(child, path, scope, visited);
+    scope.resize(scopeSize);
+    path.pop_back();
+}
+
+// registerCommand consumes the nodes, so once a tree is registered we resolve
+// its enum scopes and forget the nodes (their addresses may be reused later).
+void finalizeCommandTree(bp_cmd_node* root) {
+    std::vector<bp_cmd_node*> path, visited;
+    EnumScope scope;
+    resolveTree(root, path, scope, visited);
+    for (bp_cmd_node* n : visited) g_nodes.erase(n);
+}
+
+const char* findEnumValue(const Action& action, const char* name, int index) {
+    // Search from the innermost scope outwards so nearer arguments shadow farther ones.
+    for (auto it = action.enums.rbegin(); it != action.enums.rend(); ++it) {
+        if (std::strcmp(it->first, name) != 0) continue;
+        const std::vector<const char*>& values = *it->second;
+        const int count = static_cast<int>(values.size()) - 1; // minus the null terminator
+        if (index >= 0 && index < count) return values[index];
+        return nullptr;
+    }
+    return nullptr;
+}
+
 // Lua-callable bindings
 extern "C" {
+
+// Host -> Lua entry point for every command action.
+void commandAction(const bp_api* /*api*/, const bp_cmd_action_ctx* ctx, void* userData) {
+    Action* a = static_cast<Action*>(userData);
+    if (!a || !a->L) return; // owning plugin has been unloaded
+
+    const Action* previous = g_currentAction;
+    g_currentAction = a;
+    lua_rawgeti(a->L, LUA_REGISTRYINDEX, a->ref);
+    lua_pushlightuserdata(a->L, const_cast<bp_cmd_action_ctx*>(ctx));
+    callWithReport(a->L, 1, 0);
+    g_currentAction = previous;
+}
 
 // log.*
 int lua_log_info(lua_State* L) {
@@ -420,16 +468,28 @@ int lua_commands_execute(lua_State* L) {
     return 1;
 }
 
+// commands.unregister(name) -> true if anything was unregistered.
+// (Addon commands are also removed automatically when the addon unloads.)
+int lua_commands_unregister(lua_State* L) {
+    lua_pushboolean(L, g_api->cmd.unregisterCommand(g_api, luaL_checkstring(L, 1)));
+    return 1;
+}
+
 // Node constructors. Nodes are opaque handles; build a tree with addChild and
 // hand the root to register.
-int pushNode(lua_State* L, bp_cmd_node* node) {
+int pushNode(lua_State* L, bp_cmd_node* node, const char* name,
+             const std::vector<const char*>* enumValues = nullptr) {
     if (!node) { lua_pushnil(L); return 1; }
+    NodeInfo info;
+    info.name = name;
+    info.enumValues = enumValues;
+    g_nodes[node] = std::move(info); // overwrites any stale entry left at a reused address
     lua_pushlightuserdata(L, node);
     return 1;
 }
 int makeSimpleNode(lua_State* L, bp_cmd_node_type type) {
     const char* name = intern(luaL_checkstring(L, 1));
-    return pushNode(L, g_api->cmd.makeNode(name, type));
+    return pushNode(L, g_api->cmd.makeNode(name, type), name);
 }
 int lua_commands_literal(lua_State* L)      { return makeSimpleNode(L, BP_CMD_LITERAL); }
 int lua_commands_string(lua_State* L)       { return makeSimpleNode(L, BP_CMD_STRING); }
@@ -441,21 +501,21 @@ int lua_commands_vec3(lua_State* L)         { return makeSimpleNode(L, BP_CMD_VE
 int lua_commands_integer(lua_State* L) {
     const char* name = intern(luaL_checkstring(L, 1));
     if (lua_isnoneornil(L, 2) && lua_isnoneornil(L, 3)) {
-        return pushNode(L, g_api->cmd.makeNode(name, BP_CMD_INTEGER));
+        return pushNode(L, g_api->cmd.makeNode(name, BP_CMD_INTEGER), name);
     }
     int min = checkInt32(L, 2);
     int max = checkInt32(L, 3);
-    return pushNode(L, g_api->cmd.makeIntegerEx(name, min, max));
+    return pushNode(L, g_api->cmd.makeIntegerEx(name, min, max), name);
 }
 // float(name) or float(name, min, max)
 int lua_commands_float(lua_State* L) {
     const char* name = intern(luaL_checkstring(L, 1));
     if (lua_isnoneornil(L, 2) && lua_isnoneornil(L, 3)) {
-        return pushNode(L, g_api->cmd.makeNode(name, BP_CMD_FLOAT));
+        return pushNode(L, g_api->cmd.makeNode(name, BP_CMD_FLOAT), name);
     }
     float min = static_cast<float>(luaL_checknumber(L, 2));
     float max = static_cast<float>(luaL_checknumber(L, 3));
-    return pushNode(L, g_api->cmd.makeFloatEx(name, min, max));
+    return pushNode(L, g_api->cmd.makeFloatEx(name, min, max), name);
 }
 // enum(name, {"a", "b", "c"})
 int lua_commands_enum(lua_State* L) {
@@ -478,7 +538,7 @@ int lua_commands_enum(lua_State* L) {
         lua_pop(L, 1);
     }
     values.push_back(nullptr); // the API wants a null-terminated array
-    return pushNode(L, g_api->cmd.makeEnum(name, values.data()));
+    return pushNode(L, g_api->cmd.makeEnum(name, values.data()), name, &values);
 }
 
 // addChild(parent, child) -> child, so calls can be nested/chained.
@@ -486,6 +546,7 @@ int lua_commands_addChild(lua_State* L) {
     bp_cmd_node* parent = static_cast<bp_cmd_node*>(checkHandle(L, 1, "Expected a command node"));
     bp_cmd_node* child = static_cast<bp_cmd_node*>(checkHandle(L, 2, "Expected a command node"));
     g_api->cmd.addChild(parent, child);
+    g_nodes[parent].children.push_back(child);
     lua_pushvalue(L, 2);
     return 1;
 }
@@ -499,30 +560,25 @@ int lua_commands_setAction(lua_State* L) {
     lua_pushvalue(L, 2);
     int ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
-    size_t slot;
-    auto it = g_nodeSlots.find(node);
-    if (it != g_nodeSlots.end()) {
-        // Re-setting an action on the same node reuses its slot.
-        slot = it->second;
-        if (g_actionSlots[slot].L) luaL_unref(g_actionSlots[slot].L, LUA_REGISTRYINDEX, g_actionSlots[slot].ref);
-    } else {
-        if (g_actionSlotsUsed >= MAX_COMMAND_ACTIONS) {
-            luaL_unref(L, LUA_REGISTRYINDEX, ref);
-            return luaL_error(L, "too many command actions (max %d)", static_cast<int>(MAX_COMMAND_ACTIONS));
-        }
-        slot = g_actionSlotsUsed++;
-        g_nodeSlots[node] = slot;
+    NodeInfo& info = g_nodes[node];
+    if (!info.action) {
+        g_actions.emplace_back();
+        info.action = &g_actions.back();
+    } else if (info.action->L) {
+        // Re-setting an action on the same node reuses its record.
+        luaL_unref(info.action->L, LUA_REGISTRYINDEX, info.action->ref);
     }
 
     // Always call back on the VM's main thread, even if registered from a coroutine.
-    g_actionSlots[slot].L = mainThread(L);
-    g_actionSlots[slot].ref = ref;
-    g_api->cmd.setAction(g_api, node, g_trampolines[slot]);
+    info.action->L = mainThread(L);
+    info.action->ref = ref;
+    g_api->cmd.setAction(g_api, node, commandAction, info.action);
     return 0;
 }
 
 int lua_commands_register(lua_State* L) {
     bp_cmd_node* root = static_cast<bp_cmd_node*>(checkHandle(L, 1, "Expected a command node"));
+    finalizeCommandTree(root); // must run before the host consumes the nodes
     g_api->cmd.registerCommand(g_api, root);
     return 0;
 }
@@ -571,11 +627,16 @@ int lua_commands_getBooleanArg(lua_State* L) {
     lua_pushboolean(L, out);
     return 1;
 }
+// The host reports an index into the enum's value array; we map it back to the
+// string so scripts keep getting the value they declared.
 int lua_commands_getEnumArg(lua_State* L) {
     auto* ctx = static_cast<const bp_cmd_action_ctx*>(checkHandle(L, 1, "Expected a command context"));
-    const char* out = nullptr;
-    if (!g_api->cmd.getEnumArg(ctx, luaL_checkstring(L, 2), &out) || !out) { lua_pushnil(L); return 1; }
-    lua_pushstring(L, out);
+    const char* name = luaL_checkstring(L, 2);
+    int index = 0;
+    if (!g_api->cmd.getEnumArg(ctx, name, &index) || !g_currentAction) { lua_pushnil(L); return 1; }
+    const char* value = findEnumValue(*g_currentAction, name, index);
+    if (!value) { lua_pushnil(L); return 1; }
+    lua_pushstring(L, value);
     return 1;
 }
 // Returns {x, y, z, relX, relY, relZ}; the rel* booleans say which axes were
@@ -586,9 +647,9 @@ int lua_commands_getVec3Arg(lua_State* L) {
     std::memset(&out, 0, sizeof(out));
     if (!g_api->cmd.getVec3Arg(ctx, luaL_checkstring(L, 2), &out)) { lua_pushnil(L); return 1; }
     lua_newtable(L);
-    lua_pushnumber(L, out.pos[0]); lua_setfield(L, -2, "x");
-    lua_pushnumber(L, out.pos[1]); lua_setfield(L, -2, "y");
-    lua_pushnumber(L, out.pos[2]); lua_setfield(L, -2, "z");
+    lua_pushnumber(L, out.x); lua_setfield(L, -2, "x");
+    lua_pushnumber(L, out.y); lua_setfield(L, -2, "y");
+    lua_pushnumber(L, out.z); lua_setfield(L, -2, "z");
     lua_pushboolean(L, (out.relativeAxes >> BP_AXIS_X) & 1); lua_setfield(L, -2, "relX");
     lua_pushboolean(L, (out.relativeAxes >> BP_AXIS_Y) & 1); lua_setfield(L, -2, "relY");
     lua_pushboolean(L, (out.relativeAxes >> BP_AXIS_Z) & 1); lua_setfield(L, -2, "relZ");
@@ -640,6 +701,7 @@ const luaL_Reg lua_data_fns[] = {
 };
 const luaL_Reg lua_commands_fns[] = {
     {"execute", lua_commands_execute},
+    {"unregister", lua_commands_unregister},
     {"literal", lua_commands_literal},
     {"string", lua_commands_string},
     {"greedyString", lua_commands_greedyString},
@@ -740,6 +802,9 @@ void loadPluginFile(const std::filesystem::path& path) {
     std::string name = path.filename().string();
     if (!loadAndRun(raw, std::move(source), "@" + name)) {
         g_api->log.error(g_api, errorMessage(raw));
+        // The script may have registered commands before failing; the host keeps
+        // those, so make their actions no-ops before the VM is closed below.
+        detachActions(raw);
         return; // `state` destructor closes the Lua VM
     }
 
@@ -774,8 +839,14 @@ void unloadAllPlugins() {
         }
     }
     // Detach command actions so commands the host still holds become no-ops.
-    for (auto& slot : g_actionSlots) slot = ActionSlot{};
-    g_nodeSlots.clear();
+    // The Action records themselves stay allocated: the host may still hold
+    // them as userData.
+    for (Action& a : g_actions) {
+        a.L = nullptr;
+        a.ref = LUA_NOREF;
+    }
+    g_currentAction = nullptr;
+    g_nodes.clear();
     g_plugins.clear(); // each Plugin's LuaState destructor closes its lua_State
 }
 
@@ -842,9 +913,12 @@ void OnBlockUse(const bp_api* /*api*/, bp_block_use_event* ev) {
         lua_pushinteger(L, ev->blockPos.x);
         lua_pushinteger(L, ev->blockPos.y);
         lua_pushinteger(L, ev->blockPos.z);
+        // Appended after the original arguments so existing scripts keep working.
+        pushItemStack(L, ev->heldItem);
+        pushBlock(L, ev->block);
 
         // A plugin can cancel the block-use by returning `false`.
-        if (callWithReport(L, 5, 1)) applyCancelReturn(L, ev->cancel);
+        if (callWithReport(L, 7, 1)) applyCancelReturn(L, ev->cancel);
     }
 }
 
@@ -938,7 +1012,7 @@ void OnCrash(const bp_api* /*api*/, const bp_crash_event* ev) {
     }
 }
 
-void OnLoad(const bp_api* api, const bp_addon_load* /*ev*/) {
+void OnLoad(const bp_api* api) {
     // The struct layout changes between API versions, so refuse hosts older than what we were built against.
     if (api->version < ADDON_API_VERSION) {
         std::string err = "Host addon API v" + std::to_string(api->version) +
@@ -955,7 +1029,7 @@ void OnLoad(const bp_api* api, const bp_addon_load* /*ev*/) {
     api->log.info(api, msg.c_str());
 }
 
-void OnUnload(const bp_api* api, const bp_addon_unload* /*ev*/) {
+void OnUnload(const bp_api* api) {
     unloadAllPlugins();
     api->log.info(api, "Lua uninitialized!");
 }
@@ -977,6 +1051,8 @@ bp_addon_info bp_addon(const bp_api* /*api*/) {
         bpa::ADDON_ID,
         bpa::ADDON_NAME,
         bpa::ADDON_VERSION,
+        ADDON_API_VERSION,
+        0,
         bp_addon_events{
             /* playerJoin   */ bpa::OnPlayerJoin,
             /* playerLeave  */ bpa::OnPlayerLeave,
