@@ -26,7 +26,7 @@ namespace {
 
 constexpr const char* ADDON_ID = "bpa_lua";
 constexpr const char* ADDON_NAME = "Lua";
-constexpr const char* ADDON_VERSION = "0.2.1"; // keep in sync with the release tag (checked by CI)
+constexpr const char* ADDON_VERSION = "0.2.2"; // keep in sync with the release tag (checked by CI)
 
 constexpr const char* scriptsDir = "lua";
 
@@ -576,6 +576,22 @@ int lua_commands_setAction(lua_State* L) {
     return 0;
 }
 
+// setDescription(node, "text") -- shown in help/command listings.
+int lua_commands_setDescription(lua_State* L) {
+    bp_cmd_node* node = static_cast<bp_cmd_node*>(checkHandle(L, 1, "Expected a command node"));
+    // The host may keep the pointer, so the string is interned for the process lifetime.
+    const char* description = intern(luaL_checkstring(L, 2));
+    g_api->cmd.setDescription(node, description);
+    return 0;
+}
+
+// requireOperator(node) -- restricts the node to operators.
+int lua_commands_requireOperator(lua_State* L) {
+    bp_cmd_node* node = static_cast<bp_cmd_node*>(checkHandle(L, 1, "Expected a command node"));
+    g_api->cmd.requireOperator(node);
+    return 0;
+}
+
 int lua_commands_register(lua_State* L) {
     bp_cmd_node* root = static_cast<bp_cmd_node*>(checkHandle(L, 1, "Expected a command node"));
     finalizeCommandTree(root); // must run before the host consumes the nodes
@@ -712,6 +728,8 @@ const luaL_Reg lua_commands_fns[] = {
     {"vec3", lua_commands_vec3},
     {"addChild", lua_commands_addChild},
     {"setAction", lua_commands_setAction},
+    {"setDescription", lua_commands_setDescription},
+    {"requireOperator", lua_commands_requireOperator},
     {"register", lua_commands_register},
     {"sendFeedback", lua_commands_sendFeedback},
     {"getExecutor", lua_commands_getExecutor},
