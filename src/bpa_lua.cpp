@@ -26,7 +26,7 @@ namespace {
 
 constexpr const char* ADDON_ID = "bpa_lua";
 constexpr const char* ADDON_NAME = "Lua";
-constexpr const char* ADDON_VERSION = "0.2.2"; // keep in sync with the release tag (checked by CI)
+constexpr const char* ADDON_VERSION = "0.6.0"; // keep in sync with the release tag (checked by CI)
 
 constexpr const char* scriptsDir = "lua";
 
